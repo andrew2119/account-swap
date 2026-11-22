@@ -55,6 +55,7 @@ dry run: nothing was stopped, copied or written. Run again with --go to move the
 ```
 
 Each row is one of `move`, `wait` (Claude's session record says it is mid-turn or waiting on a prompt, or Firstmate's busy record says busy), `already there`, or `refused` with the reason.
+A missing Firstmate busy record supplies no busy signal, while an existing record that is unreadable, non-UTF-8, malformed, lacks `state`, or names a state other than `busy` or `idle` is treated as busy.
 A session with no Firstmate record, such as the main First Mate's own, is listed and never moved, and so is the session running the tool.
 
 ## What `--go` does for each agent
