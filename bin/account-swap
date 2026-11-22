@@ -832,15 +832,24 @@ class Fleet:
 
     @staticmethod
     def _busy_record(record: Record) -> str | None:
+        path = record.meta.with_suffix(".busy-state")
         try:
-            text = record.meta.with_suffix(".busy-state").read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
-        for token in text.split():
-            key, _, value = token.partition("=")
-            if key == "state":
-                return value
-        return None
+        except (OSError, UnicodeDecodeError):
+            return "busy"
+        tokens = text.split()
+        if not tokens or tokens[0] != "v1":
+            return "busy"
+        fields: dict[str, str] = {}
+        for token in tokens[1:]:
+            key, separator, value = token.partition("=")
+            if not separator or not key or not value or key in fields:
+                return "busy"
+            fields[key] = value
+        state = fields.get("state")
+        return state if state in ("busy", "idle") else "busy"
 
 
 class RecordLock:

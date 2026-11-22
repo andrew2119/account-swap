@@ -237,6 +237,12 @@ if trigger.is_file():
     os.replace(temporary, session)
     trigger.unlink()
     (state / "trust-made-busy").write_text(str(session))
+trigger = state / "invalid-busy-record-on-trust"
+if trigger.is_file():
+    busy_record = Path(trigger.read_text())
+    busy_record.write_text("v1 gen=8 state=unexpected\n")
+    trigger.unlink()
+    (state / "trust-made-invalid-busy-record").write_text(str(busy_record))
 '''
 
 STUB_LOCK_LIBRARY = r'''# Stand-in for Firstmate's bin/fm-wake-lib.sh record lock.
@@ -887,6 +893,68 @@ class AccountSwapTest(unittest.TestCase):
         self.assert_resumed_on(agent, 1)
         self.assertIn("waiting: Claude reports it is mid-turn", text)
         self.assertEqual(list(target.parent.glob(f"{agent.sid}.jsonl.older-copy-*")), [])
+
+    def assert_invalid_busy_record_is_treated_as_busy(self, task: str, prepare) -> None:
+        agent = self.worker(self.box.domain, task)
+        busy_record = (self.box.domain / f"state/{task}.meta").with_suffix(".busy-state")
+        prepare(busy_record)
+
+        result = self.box.run("worker", task, "--to", "1", "--go", constants={"PAUSE_SECONDS": 1})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("its Firstmate busy record says it is mid-turn", result.stdout)
+        self.assertIn("not moved: still busy after 1 s", result.stdout)
+        self.assert_still_running(agent, 2)
+        self.assertNotIn(("pane", "run"), self.box.herdr_commands())
+
+    def test_an_unreadable_busy_record_is_treated_as_busy(self) -> None:
+        def prepare(path: Path) -> None:
+            path.write_text("v1 state=idle\n")
+            path.chmod(0)
+
+        self.assert_invalid_busy_record_is_treated_as_busy("i1", prepare)
+
+    def test_a_non_utf8_busy_record_is_treated_as_busy(self) -> None:
+        self.assert_invalid_busy_record_is_treated_as_busy("i2", lambda path: path.write_bytes(b"v1 state=\xff\n"))
+
+    def test_a_malformed_busy_record_is_treated_as_busy(self) -> None:
+        self.assert_invalid_busy_record_is_treated_as_busy(
+            "i3", lambda path: path.write_text("v1 gen=4 malformed state=idle\n"))
+
+    def test_a_busy_record_missing_state_is_treated_as_busy(self) -> None:
+        self.assert_invalid_busy_record_is_treated_as_busy("i4", lambda path: path.write_text("v1 gen=4 seq=2\n"))
+
+    def test_a_busy_record_with_an_unknown_state_is_treated_as_busy(self) -> None:
+        self.assert_invalid_busy_record_is_treated_as_busy(
+            "i5", lambda path: path.write_text("v1 gen=4 state=unexpected\n"))
+
+    def test_an_invalid_busy_record_at_the_final_check_waits_without_signalling(self) -> None:
+        agent = self.worker(self.box.domain, "i6")
+        busy_record = (self.box.domain / "state/i6.meta").with_suffix(".busy-state")
+        (self.box.state / "invalid-busy-record-on-trust").write_text(str(busy_record))
+        command = [sys.executable, "-c", CONSTANTS_RUNNER, str(TOOL),
+                   json.dumps({"PAUSE_SECONDS": 8, "BUSY_RECHECK_SECONDS": 1}),
+                   "worker", "i6", "--to", "1", "--go"]
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=self.box.environment())
+        wait_for(lambda: (self.box.state / "trust-made-invalid-busy-record").is_file(),
+                 what="trust to make the busy record invalid")
+        output = []
+        while True:
+            line = process.stdout.readline()
+            self.assertTrue(line, "account-swap exited before waiting on the invalid busy record")
+            output.append(line)
+            if "waiting: its Firstmate busy record says it is mid-turn" in line:
+                break
+
+        self.assertTrue(alive(agent.pid), "an agent with an invalid busy record is not signalled")
+        self.assertNotIn(("pane", "run"), self.box.herdr_commands())
+        busy_record.unlink()
+        stdout, stderr = process.communicate(timeout=60)
+        output.append(stdout)
+        text = "".join(output)
+
+        self.assertEqual(process.returncode, 0, text + stderr)
+        self.assert_resumed_on(agent, 1)
 
     def test_a_busy_agent_is_left_running_after_the_wait(self) -> None:
         agent = self.worker(self.box.domain, "b1", environment={"STUB_STATUS": "busy"})
