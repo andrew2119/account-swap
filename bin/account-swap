@@ -1,0 +1,1709 @@
+#!/usr/bin/env python3
+"""Move running Claude agents to another Claude account, keeping each exact conversation.
+
+Three scopes: one worker, one lead (a second mate's own conversation, with
+--with-crew also its workers), or every recorded agent running on one account.
+Every run first prints the plan: each agent, its Firstmate home, the account it
+runs on now, its conversation id and the account it moves to. Nothing acts
+without --go.
+
+For each agent --go waits for its next pause (an agent still busy after
+PAUSE_SECONDS is left running), copies the conversation (the transcript, its
+side folder and its file history) into the target account and verifies the
+copy byte for byte while the agent still runs, stops the agent, copies and
+verifies again (both ways: a file the source no longer has does not stay in the
+target), resumes the same conversation in the same Herdr pane on the target
+account, proves it (a new process on the target account, the same conversation
+id, the transcript under the target folder) and only then updates that agent's
+Firstmate record, under Firstmate's own record lock, keeping a dated copy of
+the old record. Nothing on the source account is deleted or changed, and an
+existing copy on the target is set aside under a dated name, never
+overwritten. A failed check before the stop signal leaves the agent running as
+it was; any failure once the stop signal is sent resumes it on its own account,
+or says plainly that it is stopped and how to resume it.
+
+The resumed agent starts from a cleared environment holding only the names in
+CARRIED (and CARRIED_GIT_KEYS), so no other environment value is ever written.
+An agent whose environment can override the chosen account (ACCOUNT_OVERRIDE)
+is refused, naming only the variable; its value is never printed, copied or
+changed.
+
+Never touched: credentials, the Keychain, login items, any home's
+config/claude-account pin, any account's settings.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import fcntl
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+NAME = "account-swap"
+ACCOUNT_FOLDERS = ((1, Path(".claude")),
+                   (2, Path(".claude-profiles/acct2")),
+                   (3, Path(".claude-profiles/acct3")))
+MAIN_HOME = Path(".harness/main/firstmate")
+LEAD_HOMES = Path(".harness/homes")
+PROTECTED_FILE = Path(".config") / NAME / "protected-conversations"
+IDENTIFIER = re.compile(r"[A-Za-z0-9._-]+")
+SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+PROTECTED_ENTRY = re.compile(
+    r"[0-9a-f]{8}(?:"
+    r"|-[0-9a-f]{0,4}"
+    r"|-[0-9a-f]{4}-[0-9a-f]{0,4}"
+    r"|-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{0,4}"
+    r"|-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{0,12})")
+CLOCK = re.compile(r"[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}")
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
+# Claude's launch flags this tool carries onto the resume unchanged. Anything
+# else, an option it does not know or a launch shape a resume cannot keep
+# (--continue, --print, --session-id, ...), refuses the move.
+VALUE_FLAGS = frozenset({
+    "--settings", "--append-system-prompt", "--append-system-prompt-file", "--system-prompt",
+    "--system-prompt-file", "--model", "--effort", "--permission-mode", "--fallback-model",
+    "--agent", "--agents", "--add-dir", "--mcp-config", "--allowedTools", "--allowed-tools",
+    "--disallowedTools", "--disallowed-tools", "--tools", "--betas", "--plugin-dir",
+    "--plugin-url", "--setting-sources", "--debug-file", "--name", "-n", "--autocompact",
+    "--max-budget-usd", "--permission-prompts", "--system-prompt-snapshot",
+    "--remote-control-session-name-prefix", "--file"})
+SWITCH_FLAGS = frozenset({
+    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--verbose",
+    "--ide", "--chrome", "--no-chrome", "--strict-mcp-config", "--disable-slash-commands",
+    "--brief", "--ax-screen-reader", "--exclude-dynamic-system-prompt-sections", "--safe-mode",
+    "--restricted", "--bare"})
+RESUME_FLAGS = frozenset({"--resume", "-r"})
+# The only environment names a resumed agent is started with, each with the
+# value the agent itself was started with. Every other variable is left out, so
+# no other environment value is ever written into a resume command or a log.
+# CLAUDE_CONFIG_DIR is not carried: the target account sets it (account 1
+# leaves it unset).
+CARRIED = frozenset({
+    # The session, as Firstmate's own cleared-environment launch keeps it.
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "COLORTERM", "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TMP", "TEMP", "GOTMPDIR",
+    "SSH_AUTH_SOCK", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    # The pane's terminal multiplexer: its identity and routing.
+    "HERDR_ENV", "HERDR_SESSION", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID", "HERDR_BIN_PATH", "TMUX", "TMUX_PANE", "ZELLIJ", "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "CMUX_TAB_ID", "CMUX_PANEL_ID",
+    "CMUX_SOCKET_PATH",
+    # Firstmate's task markers and launch settings.
+    "FM_TASK_ID", "FM_HOME", "FM_ROOT_OVERRIDE", "FM_STATE_OVERRIDE", "FM_DATA_OVERRIDE",
+    "FM_PROJECTS_OVERRIDE", "FM_CONFIG_OVERRIDE", "FM_PUBLIC_FOLLOWUP_PRIMARY_HOME",
+    "FM_TRACE_CONTEXT", "FM_SUPERVISION_MODEL", "FM_ZELLIJ_SESSION", "TRACEPARENT",
+    "COMPACT_ADVISER_DISABLE", "LAVISH_AXI_HOST",
+    # Claude's own settings that choose models and behaviour, never a login.
+    "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "DISABLE_AUTOUPDATER"})
+# Git settings carried from the environment (GIT_CONFIG_COUNT and its
+# GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> pairs), by key, lowercased: Firstmate
+# points each worker's git at its commit-message hooks this way. Any other key
+# could carry a credential (an http.extraHeader, say), so an agent with one is
+# refused rather than resumed without it.
+CARRIED_GIT_KEYS = frozenset({"core.hookspath"})
+SETTINGS_CREDENTIAL_KEYS = frozenset({"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"})
+GIT_CONFIG_LIMIT = 64
+# Variables Claude ranks above an account folder's stored login, or that send it
+# to another provider or endpoint (code.claude.com/docs/en/authentication,
+# "Authentication precedence", and code.claude.com/docs/en/env-vars). An agent
+# whose environment, or whose inline --settings env, holds one is refused.
+ACCOUNT_OVERRIDE = re.compile(
+    r"ANTHROPIC_(?:[A-Z0-9_]*_)?(?:API_KEY|AUTH_TOKEN|BASE_URL)"
+    r"|ANTHROPIC_(?:CUSTOM_HEADERS|PROFILE|FEDERATION_RULE_ID|VERTEX_PROJECT_ID|FOUNDRY_RESOURCE)"
+    r"|CLAUDE_CODE_OAUTH_[A-Z0-9_]+|CLAUDE_CODE_USE_[A-Z0-9_]+|AWS_BEARER_TOKEN_BEDROCK")
+STATUS_WORDS = {"busy": "is mid-turn", "waiting": "is waiting on a prompt",
+                "shell": "is running a shell command"}
+HERDR_SECONDS = 20
+STOP_SECONDS = 30
+RESUME_SECONDS = 45
+SHELL_SECONDS = 10
+EXITED_AT_ONCE_SECONDS = 4
+LOCK_SECONDS = 30
+BUSY_RECHECK_SECONDS = 10
+# The one waiting policy: --go waits this long for a busy agent's next pause,
+# then leaves it running as it was.
+PAUSE_SECONDS = 240
+
+OWN_SESSION = "it is the session running this tool; another session must move it"
+
+EXIT_NOT_ALL_MOVED = 1
+EXIT_NOTHING = 3
+
+# Holds Firstmate's own record lock (bin/fm-wake-lib.sh in the home whose state
+# holds the record) while this program rewrites the record: it prints
+# "locked", waits for "done" on its input, then releases. With "check" it
+# only proves the library offers the lock.
+LOCK_DRIVER = r'''
+. "$1" || exit 90
+for function in fm_meta_lock_path fm_lock_acquire_wait_bounded fm_lock_release; do
+  declare -F "$function" >/dev/null || exit 91
+done
+lock=$(fm_meta_lock_path "$2") || exit 92
+[ "${3:-}" != check ] || exit 0
+fm_lock_acquire_wait_bounded "$lock" "$4" || exit 93
+printf 'locked\n'
+IFS= read -r reply || reply=
+fm_lock_release "$lock"
+[ "$reply" = done ] || exit 94
+'''
+
+
+class Refusal(Exception):
+    """A check failed before the agent was stopped; it is left as it was."""
+
+
+class MoveError(Exception):
+    """A check failed after the stop signal was sent."""
+
+
+@dataclass(frozen=True)
+class Account:
+    number: int
+    root: Path
+
+    @property
+    def label(self) -> str:
+        return f"account {self.number}"
+
+    @property
+    def record_value(self) -> str:
+        return "ordinary" if self.number == 1 else str(self.root)
+
+    @property
+    def environment_text(self) -> str:
+        if self.number == 1:
+            return "the default login, CLAUDE_CONFIG_DIR unset"
+        return f"CLAUDE_CONFIG_DIR={self.root}"
+
+
+@dataclass(frozen=True)
+class Process:
+    pid: int
+    ppid: int
+    state: str
+    started: str
+    args: str
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    account: Account
+    pid: int
+    sid: str | None
+    cwd: str | None
+    status: str | None
+    live: bool
+    current: bool
+
+
+@dataclass
+class Record:
+    kind: str
+    id: str
+    meta: Path
+    fields: dict[str, str]
+
+    @property
+    def owner(self) -> Path:
+        """The Firstmate home whose state folder holds this record."""
+        return self.meta.parent.parent
+
+    @property
+    def home(self) -> Path:
+        """The agent's Firstmate home: a lead's own home, or the home recording a worker."""
+        return Path(self.fields.get("home") or "") if self.kind == "lead" else self.owner
+
+    @property
+    def home_known(self) -> bool:
+        return self.kind != "lead" or (os.path.isabs(self.fields.get("home", "")) and self.home.is_dir())
+
+    @property
+    def label(self) -> str:
+        return f"{self.kind} {self.id}"
+
+
+@dataclass
+class Agent:
+    record: Record
+    running: bool = False
+    problem: str | None = None
+    pid: int | None = None
+    parent: int | None = None
+    started: str | None = None
+    argv: list[str] = field(default_factory=list)
+    carried: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    account: Account | None = None
+    sid: str | None = None
+    protected: bool = False
+    status: str | None = None
+    busy_record: str | None = None
+    transcript: Path | None = None
+    own: bool = False
+    record_endpoint: dict[str, str] = field(default_factory=dict)
+    record_backup: Path | None = None
+
+    @property
+    def label(self) -> str:
+        return self.record.label
+
+    @property
+    def session(self) -> str:
+        return self.record.fields.get("herdr_session", "")
+
+    @property
+    def pane(self) -> str:
+        return self.record.fields.get("herdr_pane_id", "")
+
+
+@dataclass
+class Outcome:
+    agent: Agent
+    result: str
+    text: str
+
+
+class Reporter:
+    """Prints progress and keeps the same lines in the run log once acting."""
+
+    def __init__(self) -> None:
+        self.log: Path | None = None
+
+    def line(self, text: str = "", *, error: bool = False) -> None:
+        print(text, file=sys.stderr if error else sys.stdout, flush=True)
+        if self.log is not None:
+            with self.log.open("a", encoding="utf-8", errors="replace") as handle:
+                handle.write(text + "\n")
+
+
+class Interrupt:
+    requested = False
+
+    def install(self, reporter: Reporter) -> None:
+        def handle(_signum, _frame) -> None:
+            if not self.requested:
+                reporter.line(f"{NAME}: stop requested; the agent being moved is finished first, "
+                              "and no further agent is started", error=True)
+            self.requested = True
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, handle)
+
+
+def run_quiet(command: list[str], *, timeout: float, env: dict[str, str] | None = None
+              ) -> subprocess.CompletedProcess:
+    # A new session keeps a terminal Ctrl-C from reaching helpers mid-step.
+    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          errors="replace", timeout=timeout, env=env, check=False,
+                          start_new_session=True)
+
+
+def last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def decode(raw: bytes) -> str:
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def same_path(first: str | Path | None, second: str | Path | None) -> bool:
+    if not first or not second:
+        return False
+    return os.path.realpath(first) == os.path.realpath(second)
+
+
+def clock_text(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    return text if CLOCK.fullmatch(text) else None
+
+
+def environment_map(entries: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for entry in entries:
+        key, separator, value = entry.partition("=")
+        if separator and key not in mapping:
+            mapping[key] = value
+    return mapping
+
+
+def account_overrides(environment: dict[str, str]) -> list[str]:
+    """The names, never the values, that could override the account Claude runs on."""
+    return sorted(name for name in environment if ACCOUNT_OVERRIDE.fullmatch(name))
+
+
+def launch_argument_refusal(argv: list[str]) -> str | None:
+    """Why a carried launch argument could contain an account or credential."""
+    for index, argument in enumerate(argv[1:], start=1):
+        flag, equals, inline = argument.partition("=")
+        if flag != "--settings":
+            continue
+        value = inline if equals else (argv[index + 1] if index + 1 < len(argv) else "")
+        try:
+            settings = json.loads(value)
+        except ValueError:
+            return "its --settings names a file whose contents this tool cannot vouch for"
+        if not isinstance(settings, dict):
+            return "its --settings does not contain an inline JSON object this tool can vouch for"
+        credentials = sorted(SETTINGS_CREDENTIAL_KEYS & settings.keys())
+        if credentials:
+            return f"its --settings value sets credential key {', '.join(credentials)}"
+        if "env" in settings:
+            env = settings["env"]
+            names = sorted(str(name) for name in env) if isinstance(env, dict) else ["env"]
+            return f"its --settings value sets environment variables ({', '.join(names)})"
+    for index, argument in enumerate(argv[1:], start=1):
+        flag, equals, inline = argument.partition("=")
+        if flag != "--mcp-config":
+            continue
+        value = inline if equals else (argv[index + 1] if index + 1 < len(argv) else "")
+        try:
+            json.loads(value)
+        except ValueError:
+            continue
+        return ("its inline --mcp-config value can carry credentials (env, headers, args or url); "
+                "this tool never writes such values into a resume command")
+    return None
+
+
+def carried_environment(environment: dict[str, str]) -> dict[str, str]:
+    """The part of an agent's environment its resume is started with."""
+    carried = {name: value for name, value in environment.items() if name in CARRIED}
+    count = environment.get("GIT_CONFIG_COUNT")
+    if count is None:
+        return carried
+    if not count.isdigit() or int(count) > GIT_CONFIG_LIMIT:
+        raise Refusal("its environment sets GIT_CONFIG_COUNT to a value git would not read")
+    for index in range(int(count)):
+        key, value = f"GIT_CONFIG_KEY_{index}", f"GIT_CONFIG_VALUE_{index}"
+        if key not in environment or value not in environment:
+            raise Refusal(f"its environment sets GIT_CONFIG_COUNT but not {key} and {value}")
+        if environment[key].lower() not in CARRIED_GIT_KEYS:
+            raise Refusal(f"its environment sets git configuration this tool does not carry onto a resume ({key})")
+        carried[key], carried[value] = environment[key], environment[value]
+    carried["GIT_CONFIG_COUNT"] = count
+    return carried
+
+
+def darwin_environment(pid: int) -> list[str]:
+    """The environment a process started with, from macOS's KERN_PROCARGS2."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    argmax = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(argmax))
+    names = (ctypes.c_int * 2)(1, 8)  # CTL_KERN, KERN_ARGMAX
+    if libc.sysctl(names, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "sysctl KERN_ARGMAX failed")
+    buffer = ctypes.create_string_buffer(argmax.value)
+    size = ctypes.c_size_t(argmax.value)
+    names = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    if libc.sysctl(names, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    data = buffer.raw[:size.value]
+    if len(data) < 5:
+        raise OSError(0, "empty process arguments")
+    argc = struct.unpack("i", data[:4])[0]
+    rest = data[4:]
+    index = rest.find(b"\0")  # the end of the executable path
+    if index < 0:
+        raise OSError(0, "malformed process arguments")
+    while index < len(rest) and rest[index] == 0:
+        index += 1
+    parts = rest[index:].split(b"\0")
+    environment = []
+    for part in parts[argc:]:
+        if not part:
+            break
+        environment.append(decode(part))
+    return environment
+
+
+def process_environment(pid: int) -> list[str]:
+    if sys.platform == "darwin":
+        return darwin_environment(pid)
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    return [decode(part) for part in raw.split(b"\0") if part]
+
+
+def process_table() -> dict[int, Process]:
+    # C locale and UTC give the same start-time text Claude records as procStart.
+    try:
+        result = run_quiet(["ps", "-A", "-ww", "-o", "pid=,ppid=,stat=,lstart=,args="], timeout=30,
+                           env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except subprocess.TimeoutExpired:
+        raise Refusal("the process list could not be read within 30 s") from None
+    if result.returncode != 0:
+        raise Refusal(f"the process list cannot be read ({last_line(result.stderr) or f'exit {result.returncode}'})")
+    table = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 8)
+        if len(parts) < 8 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        table[int(parts[0])] = Process(int(parts[0]), int(parts[1]), parts[2],
+                                       " ".join(parts[3:8]), parts[8] if len(parts) > 8 else "")
+    return table
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    state = run_quiet(["ps", "-o", "stat=", "-p", str(pid)], timeout=10).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def is_shell(args: str) -> bool:
+    words = args.split()
+    return bool(words) and Path(words[0]).name.lstrip("-") in SHELLS
+
+
+def is_claude(entry: dict) -> bool:
+    argv = entry.get("argv") if isinstance(entry.get("argv"), list) else []
+    first = entry.get("argv0") or (argv[0] if argv else "")
+    return isinstance(first, str) and Path(first).name == "claude"
+
+
+def carry_arguments(argv: list[str], sid: str) -> list[str]:
+    """Claude's launch arguments without its first prompt, ready for --resume."""
+    if not argv:
+        raise Refusal("its launch command cannot be read")
+    kept, prompts, index = [argv[0]], [], 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--":
+            prompts.extend(argv[index + 1:])
+            break
+        flag, equals, inline = argument.partition("=") if argument.startswith("--") else (argument, "", "")
+        if flag in RESUME_FLAGS:
+            value = inline if equals else (argv[index + 1] if index + 1 < len(argv) else None)
+            if value != sid:
+                raise Refusal("it was started as a resume of another conversation")
+            index += 1 if equals else 2
+        elif flag in VALUE_FLAGS:
+            if equals:
+                kept.append(argument)
+                index += 1
+            elif index + 1 < len(argv):
+                kept += [argument, argv[index + 1]]
+                index += 2
+            else:
+                raise Refusal(f"its launch flag {flag} has no value")
+        elif flag in SWITCH_FLAGS and not equals:
+            kept.append(argument)
+            index += 1
+        elif argument.startswith("-") and argument != "-":
+            raise Refusal(f"it was started with {flag}, which this tool does not carry onto a resume")
+        else:
+            prompts.append(argument)
+            index += 1
+    if len(prompts) > 1:
+        raise Refusal("it was started with more than one prompt argument")
+    return kept
+
+
+def protected_prefixes(home: Path) -> tuple[str, ...]:
+    """The conversation id prefixes listed in this machine's protected-conversations file."""
+    prefixes: list[str] = []
+    path = home / PROTECTED_FILE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise Refusal(f"protected conversation list {path} cannot be read ({error.strerror or error})") from None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        line = raw[:error.start].count(b"\n") + 1
+        raise Refusal(f"protected conversation list {path} is not valid UTF-8 at line {line}") from None
+    for number, line in enumerate(text.splitlines(), start=1):
+        entry = line.split("#", 1)[0].strip().lower()
+        if entry and not PROTECTED_ENTRY.fullmatch(entry):
+            raise Refusal(f"protected conversation list {path} has an invalid id prefix at line {number}")
+        if entry:
+            prefixes.append(entry)
+    return tuple(prefixes)
+
+
+def read_record(meta: Path) -> Record | None:
+    try:
+        text = meta.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key not in fields:
+            fields[key] = value
+    kind = "lead" if fields.get("kind") == "secondmate" else "worker"
+    return Record(kind, meta.stem, meta, fields)
+
+
+def reread_endpoint(record: Record) -> Record:
+    current = read_record(record.meta)
+    if current is None:
+        raise Refusal("its Firstmate record is missing or unreadable; print the plan again")
+    endpoint = ("herdr_session", "herdr_pane_id")
+    if any(current.fields.get(key) != record.fields.get(key) for key in endpoint):
+        raise Refusal("its Firstmate record points to a different endpoint; print the plan again")
+    return current
+
+
+def busy_reason(agent: Agent) -> str | None:
+    if agent.status not in (None, "idle"):
+        return f"Claude reports it {STATUS_WORDS.get(agent.status, 'has status ' + str(agent.status))}"
+    if agent.busy_record == "busy":
+        return "its Firstmate busy record says it is mid-turn"
+    return None
+
+
+class Fleet:
+    """This machine's Firstmate homes, Claude accounts and running agents."""
+
+    def __init__(self, home: Path) -> None:
+        self.home = home
+        self.accounts = {number: Account(number, home / folder) for number, folder in ACCOUNT_FOLDERS}
+        self.main_home = home / MAIN_HOME
+        self.herdr = shutil.which("herdr")
+        self.protected = protected_prefixes(home)
+        self.table: dict[int, Process] = {}
+        self.sessions: dict[tuple[int, int], SessionRecord] = {}
+        self.mine: set[int] = set()
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.table = process_table()
+        self.sessions = {}
+        for account in self.accounts.values():
+            folder = account.root / "sessions"
+            if not folder.is_dir():
+                continue
+            for path in sorted(folder.glob("*.json")):
+                if path.stem.isdigit():
+                    self._load_session(account, int(path.stem), path)
+        self.mine = set()
+        pid = os.getpid()
+        while pid > 1 and pid not in self.mine:
+            self.mine.add(pid)
+            process = self.table.get(pid)
+            if process is None:
+                break
+            pid = process.ppid
+
+    def _load_session(self, account: Account, pid: int, path: Path) -> None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("pid") not in (None, pid):
+            return
+        process = self.table.get(pid)
+        recorded, actual = clock_text(data.get("procStart")), clock_text(process.started if process else None)
+        running = process is not None and not process.state.startswith("Z")
+        live = running and (recorded is None or actual is None or recorded == actual)
+        current = running and recorded is not None and actual is not None and recorded == actual
+        text = lambda key: data.get(key) if isinstance(data.get(key), str) else None  # noqa: E731
+        self.sessions[(account.number, pid)] = SessionRecord(
+            account, pid, text("sessionId"), text("cwd"), text("status"), live, current)
+
+    def session_record(self, account: Account, pid: int) -> SessionRecord | None:
+        path = account.root / "sessions" / f"{pid}.json"
+        if path.is_file():
+            self._load_session(account, pid, path)
+        return self.sessions.get((account.number, pid))
+
+    def holders(self, sid: str) -> set[int]:
+        """Every other live process that has this conversation open."""
+        holders = {record.pid for record in self.sessions.values() if record.live and record.sid == sid}
+        resume = re.compile(r"(?:^|\s)(?:--resume|-r)(?:=|\s+)" + re.escape(sid) + r"(?:\s|$)")
+        holders |= {process.pid for process in self.table.values()
+                    if not process.state.startswith("Z") and resume.search(process.args)}
+        return holders - self.mine
+
+    def account_for(self, environment: dict[str, str]) -> tuple[Account | None, str]:
+        if "CLAUDE_CONFIG_DIR" not in environment:
+            return self.accounts[1], ""
+        value = environment["CLAUDE_CONFIG_DIR"]
+        if value:
+            for account in self.accounts.values():
+                if account.number != 1 and same_path(value, account.root):
+                    return account, ""
+            if same_path(value, self.accounts[1].root):
+                return None, ("it runs with CLAUDE_CONFIG_DIR set to account 1's folder written out, "
+                              "a login separate from account 1 (which leaves it unset)")
+            return None, "it runs with CLAUDE_CONFIG_DIR set to a folder that is not one of this tool's accounts"
+        return None, "it runs with CLAUDE_CONFIG_DIR set but empty"
+
+    def is_protected(self, sid: str) -> bool:
+        return sid.lower().startswith(self.protected)
+
+    # Firstmate homes and records.
+
+    def homes(self) -> list[Path]:
+        found = [self.main_home] if (self.main_home / "state").is_dir() else []
+        root = self.home / LEAD_HOMES
+        if root.is_dir():
+            found += [entry / "firstmate" for entry in sorted(root.iterdir())
+                      if (entry / "firstmate/state").is_dir()]
+        return found
+
+    def home_label(self, path: Path) -> str:
+        if not os.path.isabs(path):
+            return "(no home recorded)"
+        if same_path(path, self.main_home):
+            return "main"
+        if same_path(path.parent.parent, self.home / LEAD_HOMES) and path.name == "firstmate":
+            return path.parent.name
+        return str(path)
+
+    def records_in(self, home: Path, kind: str) -> list[Record]:
+        records = []
+        for meta in sorted((home / "state").glob("*.meta")):
+            if meta.is_file() and IDENTIFIER.fullmatch(meta.stem):
+                record = read_record(meta)
+                if record is not None and record.kind == kind:
+                    records.append(record)
+        return records
+
+    # Herdr.
+
+    def herdr_call(self, session: str, *arguments: str) -> dict:
+        if not self.herdr:
+            raise Refusal("herdr is not on PATH")
+        try:
+            result = run_quiet([self.herdr, *arguments, "--session", session], timeout=HERDR_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise Refusal(f"Herdr did not answer within {HERDR_SECONDS} s") from None
+        if result.returncode != 0:
+            raise Refusal(f"Herdr refused ({last_line(result.stderr) or f'exit {result.returncode}'})")
+        try:
+            answer = json.loads(result.stdout)["result"]
+        except (ValueError, KeyError, TypeError):
+            raise Refusal("Herdr's answer is not the expected JSON") from None
+        if not isinstance(answer, dict):
+            raise Refusal("Herdr's answer is not the expected JSON")
+        return answer
+
+    def pane_processes(self, session: str, pane: str) -> dict:
+        info = self.herdr_call(session, "pane", "process-info", "--pane", pane).get("process_info")
+        if (not isinstance(info, dict) or type(info.get("foreground_process_group_id")) is not int
+                or not isinstance(info.get("foreground_processes"), list)):
+            raise Refusal(f"Herdr gave no process information for pane {pane}")
+        info["foreground_processes"] = [entry for entry in info["foreground_processes"]
+                                        if isinstance(entry, dict) and type(entry.get("pid")) is int]
+        return info
+
+    def pane_details(self, session: str, pane: str) -> dict:
+        details = self.herdr_call(session, "pane", "get", pane).get("pane")
+        return details if isinstance(details, dict) else {}
+
+    def type_into(self, session: str, pane: str, command: str) -> None:
+        self.herdr_call(session, "pane", "run", pane, command)
+
+    # Inspection (read-only).
+
+    def inspect(self, record: Record) -> Agent:
+        agent = Agent(record)
+        try:
+            self._inspect(agent)
+        except Refusal as refusal:
+            agent.problem = str(refusal)
+        return agent
+
+    def _inspect(self, agent: Agent) -> None:
+        record, fields = agent.record, agent.record.fields
+        if fields.get("harness") != "claude":
+            raise Refusal(f"it runs {fields.get('harness') or 'no recorded harness'}, not Claude")
+        if fields.get("window", "").startswith("remote:") or fields.get("remote_host"):
+            raise Refusal("it runs on another machine; this tool moves agents on this one only")
+        if fields.get("backend") != "herdr":
+            raise Refusal("it does not run in a Herdr pane")
+        if not agent.session or not agent.pane:
+            raise Refusal("its record names no Herdr pane")
+        if record.kind == "lead" and not record.home_known:
+            raise Refusal("its record names no home folder on this machine")
+        info = self.pane_processes(agent.session, agent.pane)
+        claudes = [entry for entry in info["foreground_processes"] if is_claude(entry)]
+        if not claudes:
+            raise Refusal(f"no Claude process runs in pane {agent.pane}")
+        process = claudes[0]
+        agent.pid = process["pid"]
+        agent.argv = [str(argument) for argument in process.get("argv") or []]
+        try:
+            environment = environment_map(process_environment(agent.pid))
+        except OSError as error:
+            raise Refusal(f"the environment of pid {agent.pid} cannot be read "
+                          f"({error.strerror or error})") from None
+        if not self._is_this_agent(record, environment, process):
+            raise Refusal(f"pane {agent.pane} now runs a different agent")
+        agent.running = True
+        if len(claudes) > 1:
+            raise Refusal(f"more than one Claude process runs in pane {agent.pane}")
+        if info["foreground_process_group_id"] != agent.pid:
+            raise Refusal("its Claude process is not the pane's foreground program")
+        agent.account, why = self.account_for(environment)
+        if agent.account is None:
+            raise Refusal(why)
+        overrides = account_overrides(environment)
+        if overrides:
+            raise Refusal(f"its environment sets {', '.join(overrides)}, which can override the account it "
+                          "runs on; this tool never reads out, copies or changes that variable")
+        argument_problem = launch_argument_refusal(agent.argv)
+        if argument_problem:
+            raise Refusal(argument_problem)
+        agent.carried = carried_environment(environment)
+        session = self.session_record(agent.account, agent.pid)
+        if session is None:
+            raise Refusal(f"no Claude session record for pid {agent.pid} on {agent.account.label}")
+        if not session.sid or not SESSION_ID.fullmatch(session.sid):
+            raise Refusal("its session record names no valid conversation id")
+        agent.sid = session.sid
+        if self.is_protected(agent.sid):
+            agent.protected = True
+            raise Refusal(f"protected conversation {agent.sid[:8]}: it is never opened, copied or moved")
+        if not session.current:
+            raise Refusal("its session record belongs to an earlier process with the same number")
+        agent.status = session.status
+        agent.busy_record = self._busy_record(record)
+        agent.cwd = session.cwd or str(process.get("cwd") or "")
+        if not os.path.isabs(agent.cwd) or not Path(agent.cwd).is_dir():
+            raise Refusal("its working folder is unknown or gone")
+        self._check_shell(agent, info)
+        matches = sorted((agent.account.root / "projects").glob(f"*/{agent.sid}.jsonl"))
+        if len(matches) != 1:
+            found = "no transcript" if not matches else f"{len(matches)} transcripts"
+            raise Refusal(f"{agent.account.label} holds {found} for conversation {agent.sid}")
+        agent.transcript = matches[0]
+        others = self.holders(agent.sid) - {agent.pid}
+        if others:
+            raise Refusal("its conversation is also open in pid " + ", ".join(map(str, sorted(others))))
+        carry_arguments(agent.argv, agent.sid)
+        agent.own = agent.pid in self.mine
+
+    @staticmethod
+    def _is_this_agent(record: Record, environment: dict[str, str], process: dict) -> bool:
+        if record.kind == "worker":
+            if "FM_TASK_ID" in environment:
+                return environment["FM_TASK_ID"] == record.id
+            return same_path(process.get("cwd"), record.fields.get("worktree"))
+        if "FM_TASK_ID" in environment:
+            return False
+        if "FM_HOME" in environment:
+            return same_path(environment["FM_HOME"], record.home)
+        return same_path(process.get("cwd"), record.home)
+
+    def _check_shell(self, agent: Agent, info: dict) -> None:
+        process = self.table.get(agent.pid)
+        if process is None:
+            raise Refusal(f"pid {agent.pid} is not in the process list")
+        agent.parent, agent.started = process.ppid, process.started
+        parent = self.table.get(process.ppid)
+        if parent is None or not is_shell(parent.args):
+            raise Refusal("it was not started from a shell, so it cannot be resumed in the same pane")
+        shell, step, pid = info.get("shell_pid"), 0, parent.pid
+        while type(shell) is int and pid != shell and step < 16 and pid in self.table:
+            pid, step = self.table[pid].ppid, step + 1
+        if pid != shell:
+            raise Refusal(f"its shell is not part of pane {agent.pane}")
+
+    @staticmethod
+    def _busy_record(record: Record) -> str | None:
+        path = record.meta.with_suffix(".busy-state")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError):
+            return "busy"
+        tokens = text.split()
+        if not tokens or tokens[0] != "v1":
+            return "busy"
+        fields: dict[str, str] = {}
+        for token in tokens[1:]:
+            key, separator, value = token.partition("=")
+            if not separator or not key or not value or key in fields:
+                return "busy"
+            fields[key] = value
+        state = fields.get("state")
+        return state if state in ("busy", "idle") else "busy"
+
+
+class RecordLock:
+    """Firstmate's own lock on one record, taken through the home's library."""
+
+    def __init__(self, record: Record) -> None:
+        self.record = record
+        self.library = record.owner / "bin/fm-wake-lib.sh"
+        self.bash = shutil.which("bash")
+
+    def _command(self, *extra: str) -> list[str]:
+        return [self.bash or "bash", "-c", LOCK_DRIVER, NAME, str(self.library), str(self.record.meta), *extra]
+
+    def _environment(self) -> dict[str, str]:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("FM_") and key != "STATE"}
+        environment["FM_HOME"] = str(self.record.owner)
+        return environment
+
+    def check(self) -> None:
+        if not self.bash:
+            raise Refusal("bash is not on PATH, so Firstmate's record lock cannot be taken")
+        if not self.library.is_file():
+            raise Refusal(f"Firstmate's record lock library {self.library} is missing")
+        try:
+            result = run_quiet(self._command("check"), timeout=LOCK_SECONDS, env=self._environment())
+        except subprocess.TimeoutExpired:
+            raise Refusal("Firstmate's record lock library did not load in time") from None
+        if result.returncode != 0:
+            raise Refusal(f"Firstmate's record lock library cannot be used (exit {result.returncode})")
+
+    def hold(self, change: Callable[[], None]) -> None:
+        process = subprocess.Popen(self._command("take", str(LOCK_SECONDS)), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                   env=self._environment(), start_new_session=True)
+        ready, _, _ = select.select([process.stdout], [], [], LOCK_SECONDS + 15)
+        line = process.stdout.readline() if ready else ""
+        if line.strip() != "locked":
+            process.kill()
+            process.wait()
+            raise MoveError("Firstmate's lock on the record could not be taken")
+        reply = "abort"
+        try:
+            change()
+            reply = "done"
+        finally:
+            try:
+                process.stdin.write(reply + "\n")
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+            status = process.wait(timeout=LOCK_SECONDS)
+        if status != 0:
+            raise MoveError(f"Firstmate's record lock was not released cleanly (exit {status})")
+
+
+class Trust:
+    """Firstmate's own workspace-trust registration, run for the target account."""
+
+    def __init__(self, record: Record) -> None:
+        self.helper = record.owner / "bin/fm-claude-trust.sh"
+        if record.kind == "lead":
+            self.arguments = ["--secondmate-home", record.fields.get("home", ""), record.id]
+        else:
+            self.arguments = [record.fields.get("worktree", ""), record.fields.get("project", "")]
+
+    def check(self) -> None:
+        if not (self.helper.is_file() and os.access(self.helper, os.X_OK)):
+            raise Refusal(f"Firstmate's trust helper {self.helper} is missing")
+        if not all(self.arguments):
+            raise Refusal("its record lacks the folders Firstmate's trust registration needs")
+
+    def register(self, account: Account) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CONFIG_DIR"}
+        if account.number != 1:
+            environment["CLAUDE_CONFIG_DIR"] = str(account.root)
+        try:
+            result = run_quiet([str(self.helper), *self.arguments], timeout=60, env=environment)
+        except subprocess.TimeoutExpired:
+            raise Refusal(f"Firstmate's trust registration on {account.label} did not finish") from None
+        if result.returncode != 0:
+            raise Refusal(f"Firstmate's trust registration on {account.label} failed "
+                          f"({last_line(result.stderr) or f'exit {result.returncode}'})")
+
+
+def digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def entries_under(path: Path) -> list[Path]:
+    if path.is_symlink() or path.is_file():
+        return [Path()]
+    if not path.is_dir():
+        return []
+    found = []
+    for directory, subdirectories, files in os.walk(path):
+        here = Path(directory)
+        for name in files + [name for name in subdirectories if (here / name).is_symlink()]:
+            found.append((here / name).relative_to(path))
+    return sorted(found)
+
+
+def copy_entry(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{NAME}-{os.getpid()}-{time.monotonic_ns()}")
+    shutil.copy2(source, temporary, follow_symlinks=False)
+    os.replace(temporary, target)
+
+
+def copy_part(source: Path, target: Path) -> set[Path]:
+    """Copies every entry under source to target; returns the entries it wrote."""
+    written = set()
+    for relative in entries_under(source):
+        try:
+            copy_entry(source / relative, target / relative)
+        except FileNotFoundError:
+            if (source / relative).exists() or (source / relative).is_symlink():
+                raise
+            continue  # gone from the source meanwhile; the comparison below settles it
+        written.add(relative)
+    if source.is_dir() and not source.is_symlink():
+        target.mkdir(parents=True, exist_ok=True)
+    return written
+
+
+def remove_own_extras(source: Path, target: Path, written: set[Path]) -> None:
+    """Removes the target entries the source no longer has, when this run wrote them.
+
+    An entry this run did not write is left in place for differences() to report.
+    """
+    for relative in sorted(set(entries_under(target)) - set(entries_under(source))):
+        if relative in written:
+            (target / relative).unlink()
+    if not target.is_dir() or target.is_symlink():
+        return
+    for directory, _, _ in os.walk(target, topdown=False):
+        here = Path(directory)
+        if not (source / here.relative_to(target)).is_dir() and not any(here.iterdir()):
+            here.rmdir()
+
+
+def differences(source: Path, target: Path) -> list[str]:
+    """Every entry that keeps the target from being an exact copy of the source, both ways."""
+    source_entries, target_entries = set(entries_under(source)), set(entries_under(target))
+    different = [f"{target / relative} (not in the source)" for relative in sorted(target_entries - source_entries)]
+    for relative in sorted(source_entries):
+        original, copy = source / relative, target / relative
+        try:
+            if original.is_symlink():
+                same = copy.is_symlink() and os.readlink(original) == os.readlink(copy)
+            else:
+                same = (copy.is_file() and not copy.is_symlink()
+                        and copy.stat().st_size == original.stat().st_size and digest(copy) == digest(original))
+        except FileNotFoundError:
+            same = False  # it changed while being compared; a later pass settles it
+        if not same:
+            different.append(str(copy))
+    return different
+
+
+def unique_path(path: Path) -> Path:
+    candidate, number = path, 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = path.with_name(f"{path.name}-{number}")
+        number += 1
+    return candidate
+
+
+def rewrite_record(text: str, account: Account, endpoint: dict[str, str]) -> str:
+    lines, written = [], False
+    for line in text.splitlines():
+        key, separator, _ = line.partition("=")
+        if separator and key == "account":
+            if not written:
+                lines.append(f"account={account.record_value}")
+                written = True
+        elif separator and key in endpoint:
+            lines.append(f"{key}={endpoint[key]}")
+        else:
+            lines.append(line)
+    if not written:
+        anchor = next((index for index, line in enumerate(lines) if line.startswith("effort=")), len(lines) - 1)
+        lines.insert(anchor + 1, f"account={account.record_value}")
+    return "\n".join(lines) + "\n"
+
+
+def move_note(source: Account, target: Account) -> str:
+    return (f"Firstmate note: this session was moved from Claude {source.label} to {target.label}. "
+            "Same conversation, same folder, same pane; nothing about your work changed. "
+            "If your last turn was cut short, re-check where it stood and carry on; "
+            "if you were waiting, keep waiting. No reply needed.")
+
+
+def restore_note(source: Account, target: Account) -> str:
+    return (f"Firstmate note: a move of this session to Claude {target.label} did not complete, "
+            f"so it resumed on its own {source.label}. Same conversation, same folder, same pane; "
+            "nothing about your work changed. If your last turn was cut short, re-check where it "
+            "stood and carry on. No reply needed.")
+
+
+def describe(error: BaseException) -> str:
+    """A plain one-line account of an unexpected failure."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        command = error.cmd[0] if isinstance(error.cmd, (list, tuple)) and error.cmd else error.cmd
+        return f"{Path(str(command)).name} did not finish within {error.timeout:g} s"
+    return str(error) or type(error).__name__
+
+
+class Mover:
+    def __init__(self, fleet: Fleet, target: Account, reporter: Reporter, run_folder: Path, stamp: str) -> None:
+        self.fleet = fleet
+        self.target = target
+        self.reporter = reporter
+        self.run_folder = run_folder
+        self.stamp = stamp
+        # Per target part, every entry this run copied there: the only target
+        # entries the final copy may remove when the source no longer has them.
+        self.written: dict[Path, set[Path]] = {}
+
+    def say(self, agent: Agent, text: str) -> None:
+        self.reporter.line(f"{agent.label} ({self.fleet.home_label(agent.record.home)}): {text}")
+
+    def launcher(self, agent: Agent, account: Account, note: str, purpose: str) -> Path:
+        environment = [f"{name}={value}" for name, value in agent.carried.items()]
+        if account.number != 1:
+            environment.append(f"CLAUDE_CONFIG_DIR={account.root}")
+        command = carry_arguments(agent.argv, agent.sid) + ["--resume", agent.sid, note]
+        text = "\n".join([
+            "#!/bin/sh",
+            f"# {NAME}: {purpose}, conversation {agent.sid} of {agent.label}, on {account.label}",
+            f"cd {shlex.quote(agent.cwd)} || exit 1",
+            "exec /usr/bin/env -i " + " ".join(shlex.quote(word) for word in environment + command),
+        ]) + "\n"
+        path = unique_path(self.run_folder / f"{agent.record.kind}-{agent.record.id}.{purpose}.sh")
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        with os.fdopen(descriptor, "w", encoding="utf-8", errors="surrogateescape") as handle:
+            handle.write(text)
+        return path
+
+    def parts(self, agent: Agent, source: Account) -> list[tuple[Path, Path]]:
+        slug, sid = agent.transcript.parent.name, agent.sid
+        return [(agent.transcript, self.target.root / "projects" / slug / f"{sid}.jsonl"),
+                (source.root / "projects" / slug / sid, self.target.root / "projects" / slug / sid),
+                (source.root / "file-history" / sid, self.target.root / "file-history" / sid)]
+
+    def copy(self, parts: list[tuple[Path, Path]], attempts: int) -> list[str]:
+        """Copies each part and compares both ways; returns what still differs."""
+        different: list[str] = []
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(1)
+            for source, target in parts:
+                written = self.written.setdefault(target, set())
+                written |= copy_part(source, target)
+                remove_own_extras(source, target, written)
+            different = [path for source, target in parts for path in differences(source, target)]
+            if not different:
+                return []
+        return different
+
+    def move(self, planned: Agent, agent: Agent) -> Outcome:
+        try:
+            source = self.prepare(planned, agent)
+        except Refusal as refusal:
+            return Outcome(agent, "refused", f"not moved: {refusal}; it is still running as it was")
+        if source is None:
+            return Outcome(agent, "already", f"already on {self.target.label}; nothing to do")
+        parts = self.parts(agent, source)
+        # Everything up to and including the stop signal: a failure here leaves
+        # the agent running as it was.
+        try:
+            forward = self.launcher(agent, self.target, move_note(source, self.target),
+                                    f"to-account-{self.target.number}")
+            back = self.launcher(agent, source, restore_note(source, self.target), f"back-to-account-{source.number}")
+            for _, target in parts:
+                if target not in self.written and (target.exists() or target.is_symlink()):
+                    aside = unique_path(target.with_name(f"{target.name}.older-copy-{self.stamp}"))
+                    os.rename(target, aside)
+                    self.say(agent, f"an older copy on {self.target.label} was set aside as {aside}")
+            different = self.copy(parts, attempts=3)
+            if different:
+                raise Refusal(f"the copy on {self.target.label} does not match the source ({different[0]}); "
+                              "the conversation is still being written")
+            self.say(agent, f"conversation {agent.sid} copied to {self.target.label} and verified byte for byte")
+            Trust(agent.record).register(self.target)
+            reason = self.confirm_unchanged(agent)
+            if reason is not None:
+                return Outcome(agent, "waiting", reason)
+            try:
+                os.kill(agent.pid, signal.SIGTERM)
+            except PermissionError:
+                raise Refusal(f"pid {agent.pid} may not be sent the stop signal by this user") from None
+            except ProcessLookupError:
+                return Outcome(agent, "failed", f"pid {agent.pid} exited by itself just before the stop signal, so "
+                               f"nothing was resumed and its record is unchanged; to resume it on {source.label}, "
+                               f"type in pane {agent.pane}: sh {shlex.quote(str(back))}")
+        except Refusal as refusal:
+            return Outcome(agent, "refused", f"not moved: {refusal}; it is still running as it was")
+        except Exception as error:  # noqa: BLE001 - nothing was signalled, so say so plainly
+            return Outcome(agent, "refused", f"not moved: {describe(error)}; it is still running as it was")
+        # The stop signal is sent: every failure from here takes the recovery path.
+        try:
+            new_pid, problem, running = self.resume_on_target(agent, parts, forward)
+        except Exception as error:  # noqa: BLE001 - the agent is stopped, so it must be resumed somewhere
+            return self.restore(agent, source, back, describe(error))
+        if new_pid is None:
+            if running:
+                return Outcome(agent, "failed", f"stopped, then {problem}; that process was left alone; "
+                               f"its conversation is untouched on {source.label}")
+            return self.restore(agent, source, back, problem)
+        return self.prove(agent, source, new_pid)
+
+    def prepare(self, planned: Agent, agent: Agent) -> Account | None:
+        if agent.problem:
+            raise Refusal(agent.problem)
+        if (agent.pid, agent.sid) != (planned.pid, planned.sid):
+            raise Refusal("it changed since the plan was printed; print the plan again")
+        if agent.account == self.target:
+            return None
+        if agent.own:
+            raise Refusal(OWN_SESSION)
+        if not self.target.root.is_dir():
+            raise Refusal(f"{self.target.label}'s folder {self.target.root} is missing")
+        RecordLock(agent.record).check()
+        Trust(agent.record).check()
+        self.prepare_record(agent)
+        return agent.account
+
+    def prepare_record(self, agent: Agent) -> None:
+        record = agent.record
+        details = self.fleet.pane_details(agent.session, agent.pane)
+        endpoint: dict[str, str] = {}
+        for key, answer in (("herdr_workspace_id", "workspace_id"), ("herdr_tab_id", "tab_id")):
+            if key not in record.fields:
+                raise Refusal(f"its Firstmate record lacks {key}")
+            value = details.get(answer)
+            if not isinstance(value, str) or not IDENTIFIER.fullmatch(value.replace(":", "")):
+                raise Refusal(f"Herdr gave no valid {answer} for pane {agent.pane}")
+            endpoint[key] = value
+        backup = unique_path(record.meta.with_name(f"{record.meta.name}.pre-account-swap-{self.stamp}"))
+
+        def preserve() -> None:
+            reread_endpoint(record)
+            shutil.copy2(record.meta, backup)
+
+        try:
+            RecordLock(record).hold(preserve)
+        except Refusal:
+            raise
+        except Exception as error:
+            raise Refusal(describe(error)) from None
+        agent.record_endpoint = endpoint
+        agent.record_backup = backup
+
+    def confirm_unchanged(self, agent: Agent) -> str | None:
+        """The last check before the stop signal: the same idle session, still in the foreground."""
+        reread_endpoint(agent.record)
+        self.fleet.refresh()
+        process = self.fleet.table.get(agent.pid)
+        info = self.fleet.pane_processes(agent.session, agent.pane)
+        if (process is None or process.started != agent.started
+                or info["foreground_process_group_id"] != agent.pid):
+            raise Refusal("it changed just before the stop")
+        session = self.fleet.session_record(agent.account, agent.pid)
+        if session is None or not session.current or session.sid != agent.sid:
+            raise Refusal("its Claude session changed just before the stop")
+        agent.status = session.status
+        agent.busy_record = self.fleet._busy_record(agent.record)
+        return busy_reason(agent)
+
+    def resume_on_target(self, agent: Agent, parts: list[tuple[Path, Path]], forward: Path
+                         ) -> tuple[int | None, str, bool]:
+        """After the stop signal: wait for the exit, copy again, resume on the target."""
+        deadline = time.monotonic() + STOP_SECONDS
+        while alive(agent.pid):
+            if time.monotonic() > deadline:
+                raise MoveError(f"pid {agent.pid} was still running {STOP_SECONDS} s after the stop signal")
+            time.sleep(0.2)
+        self.say(agent, f"pid {agent.pid} stopped")
+        self.fleet.refresh()
+        others = self.fleet.holders(agent.sid) - {agent.pid}
+        if others:
+            raise MoveError("the conversation is open in pid " + ", ".join(map(str, sorted(others))))
+        different = self.copy(parts, attempts=2)
+        if different:
+            raise MoveError(f"the final copy does not match the source ({different[0]})")
+        self.say(agent, "final copy verified byte for byte, both ways")
+        if not self.wait_for_shell(agent):
+            raise MoveError(f"pane {agent.pane} did not return to its shell")
+        self.fleet.type_into(agent.session, agent.pane, f"sh {shlex.quote(str(forward))}")
+        return self.await_resume(agent, self.target)
+
+    def wait_for_shell(self, agent: Agent) -> bool:
+        deadline = time.monotonic() + SHELL_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                info = self.fleet.pane_processes(agent.session, agent.pane)
+            except Refusal:
+                info = None
+            if (info is not None and info["foreground_process_group_id"] == agent.parent
+                    and not any(is_claude(entry) for entry in info["foreground_processes"])):
+                return True
+            time.sleep(0.25)
+        return False
+
+    def await_resume(self, agent: Agent, account: Account) -> tuple[int | None, str, bool]:
+        """Wait for a new Claude process in the pane that opened the conversation."""
+        deadline = time.monotonic() + RESUME_SECONDS
+        at_shell_since, running = None, False
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            try:
+                info = self.fleet.pane_processes(agent.session, agent.pane)
+            except Refusal:
+                continue
+            foreground = info["foreground_process_group_id"]
+            claudes = [entry for entry in info["foreground_processes"]
+                       if is_claude(entry) and entry["pid"] != agent.pid]
+            running = bool(claudes)
+            if claudes and claudes[0]["pid"] == foreground:
+                at_shell_since = None
+                session = self.fleet.session_record(account, foreground)
+                if session is not None and session.sid == agent.sid:
+                    return foreground, "", True
+                if session is not None and session.sid:
+                    return None, f"the new process {foreground} opened conversation {session.sid}", True
+            elif foreground == agent.parent and not claudes:
+                at_shell_since = at_shell_since or time.monotonic()
+                if time.monotonic() - at_shell_since > EXITED_AT_ONCE_SECONDS:
+                    return None, "the resume exited at once", False
+            else:
+                at_shell_since = None
+        return None, f"no Claude process opened the conversation within {RESUME_SECONDS} s", running
+
+    def restore(self, agent: Agent, source: Account, launcher: Path, reason: str) -> Outcome:
+        """After the stop signal: resume on the source account, or say plainly how to."""
+        self.say(agent, f"move failed after the stop signal ({reason})")
+        manual = f"type in pane {agent.pane}: sh {shlex.quote(str(launcher))}"
+        try:
+            at_shell = self.wait_for_shell(agent)
+            if alive(agent.pid):
+                return Outcome(agent, "failed", f"{reason}; it was sent the stop signal and has not exited, "
+                               "so nothing was resumed and its record is unchanged; once it has exited, "
+                               f"resume it on {source.label}: {manual}")
+            if not at_shell:
+                return Outcome(agent, "failed", f"stopped, then {reason}; pane {agent.pane} is not at its "
+                               f"shell, so nothing was resumed; to resume it on {source.label}, {manual}")
+            self.say(agent, f"resuming it on its own {source.label}")
+            self.fleet.type_into(agent.session, agent.pane, f"sh {shlex.quote(str(launcher))}")
+            new_pid, problem, _ = self.await_resume(agent, source)
+        except Exception as error:  # noqa: BLE001 - report the stopped agent rather than crash
+            new_pid, problem = None, describe(error)
+        if new_pid is None:
+            return Outcome(agent, "failed", f"stopped, then {reason}; resuming it on {source.label} also "
+                           f"failed ({problem}); to retry, {manual}")
+        return Outcome(agent, "restored", f"not moved: {reason}; resumed on its own {source.label} as pid "
+                       f"{new_pid} with conversation {agent.sid}")
+
+    def prove(self, agent: Agent, source: Account, new_pid: int) -> Outcome:
+        try:
+            account, _ = self.fleet.account_for(environment_map(process_environment(new_pid)))
+        except OSError as error:
+            return Outcome(agent, "failed", f"resumed as pid {new_pid}, but its environment cannot be "
+                           f"read to prove the account ({error.strerror or error}); record not updated")
+        transcript = self.target.root / "projects" / agent.transcript.parent.name / f"{agent.sid}.jsonl"
+        if account != self.target:
+            return Outcome(agent, "failed", f"resumed as pid {new_pid}, but not on {self.target.label}; "
+                           "record not updated")
+        try:
+            complete = not alive(agent.pid) and transcript.is_file()
+        except Exception as error:  # noqa: BLE001 - the new process runs; report, never resume twice
+            return Outcome(agent, "failed", f"resumed as pid {new_pid}, but the proof could not be completed "
+                           f"({describe(error)}); record not updated")
+        if not complete:
+            return Outcome(agent, "failed", f"resumed as pid {new_pid}, but the proof is incomplete "
+                           "(the old process or the target transcript); record not updated")
+        proof = (f"moved: pid {agent.pid} on {source.label} -> pid {new_pid} on {self.target.label} "
+                 f"in pane {agent.pane}; conversation {agent.sid} kept; transcript {transcript}")
+        try:
+            update = self.update_record(agent)
+        except Exception as error:  # noqa: BLE001 - the move stands; say exactly what to set by hand
+            values = {
+                "account": self.target.record_value,
+                "herdr_session": agent.session,
+                **agent.record_endpoint,
+                "herdr_pane_id": agent.pane,
+            }
+            needed = ", ".join(f"{key}={value}" for key, value in values.items())
+            return Outcome(agent, "failed", f"the agent is now running on {self.target.label}, but its Firstmate "
+                           f"record still names {source.label} because the record update failed "
+                           f"({describe(error)}); set {needed} in {agent.record.meta}")
+        self.say(agent, proof)
+        self.say(agent, update)
+        return Outcome(agent, "moved", proof)
+
+    def update_record(self, agent: Agent) -> str:
+        record, endpoint, changed = agent.record, agent.record_endpoint, False
+        if agent.record_backup is None:
+            raise MoveError("the record backup was not prepared before the move")
+
+        def change() -> None:
+            nonlocal changed
+            current = record.meta.read_text(encoding="utf-8")
+            try:
+                reread_endpoint(record)
+            except Refusal as refusal:
+                raise MoveError(f"{refusal}; the record was left as it is") from None
+            updated = rewrite_record(current, self.target, endpoint)
+            if updated == current:
+                return
+            temporary = record.meta.with_name(f".{record.meta.name}.{NAME}-{os.getpid()}")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 record.meta.stat().st_mode & 0o777)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, record.meta)
+            changed = True
+
+        RecordLock(record).hold(change)
+        if not changed:
+            return f"record already true: account={self.target.record_value}"
+        moved_endpoint = [f"{key}={value}" for key, value in endpoint.items() if record.fields.get(key) != value]
+        extra = f" and {', '.join(moved_endpoint)}" if moved_endpoint else ""
+        return (f"record updated: account={self.target.record_value}{extra}; "
+                f"the previous record is kept as {agent.record_backup.name}")
+
+
+def plan_cell(agent: Agent, target: Account) -> tuple[str, str]:
+    if agent.problem:
+        return "refused", f"refused: {agent.problem}"
+    if agent.account == target:
+        return "already", "already there"
+    if agent.own:
+        return "refused", f"refused: {OWN_SESSION}"
+    reason = busy_reason(agent)
+    if reason is None:
+        return "move", "move"
+    return "busy", f"wait: {reason}; --go waits up to {PAUSE_SECONDS} s for its next pause, then leaves it"
+
+
+def render_plan(fleet: Fleet, agents: list[Agent], target: Account) -> list[str]:
+    rows = [("agent", "home", "on now", "conversation", "moves to", "plan")]
+    for agent in agents:
+        conversation = agent.sid or "-"
+        if agent.protected:
+            conversation = f"{agent.sid[:8]}... (protected)"
+        rows.append((agent.label, fleet.home_label(agent.record.home),
+                     agent.account.label if agent.account else "-", conversation, target.label,
+                     plan_cell(agent, target)[1]))
+    widths = [max(len(row[index]) for row in rows) + 3 for index in range(len(rows[0]) - 1)]
+    return ["  " + "".join(f"{cell:<{width}}" for cell, width in zip(row, widths)) + row[-1] for row in rows]
+
+
+def find_home(fleet: Fleet, value: str) -> Path:
+    if value == "main":
+        candidate = fleet.main_home
+    elif IDENTIFIER.fullmatch(value):
+        candidate = fleet.home / LEAD_HOMES / value / "firstmate"
+    else:
+        candidate = Path(value).expanduser()
+    for home in fleet.homes():
+        if same_path(home, candidate):
+            return home
+    raise SystemExit(f"{NAME}: {value} is not a Firstmate home on this machine")
+
+
+def select_records(fleet: Fleet, options: argparse.Namespace, reporter: Reporter) -> list[Record] | None:
+    if options.scope == "worker":
+        homes = [find_home(fleet, options.home)] if options.home else fleet.homes()
+        found = [record for home in homes for record in fleet.records_in(home, "worker")
+                 if record.id == options.task]
+        if not found:
+            lead = fleet.main_home / "state" / f"{options.task}.meta"
+            if not options.home and (read_record(lead) or Record("worker", "", lead, {})).kind == "lead":
+                raise SystemExit(f"{NAME}: {options.task} is a lead; use: {NAME} lead {options.task}")
+            reporter.line(f"{NAME}: no worker record named {options.task} in "
+                          f"{'that home' if options.home else 'any Firstmate home'}", error=True)
+            return None
+        if len(found) > 1:
+            names = ", ".join(fleet.home_label(record.owner) for record in found)
+            raise SystemExit(f"{NAME}: worker {options.task} is recorded in more than one home ({names}); "
+                             "pass --home")
+        return found
+    if options.scope == "lead":
+        record = read_record(fleet.main_home / "state" / f"{options.lead}.meta")
+        if record is None or record.kind != "lead":
+            reporter.line(f"{NAME}: no lead record named {options.lead} in the main Firstmate home", error=True)
+            return None
+        crew = fleet.records_in(record.home, "worker") if options.with_crew and record.home_known else []
+        return [record, *crew]
+    leads = fleet.records_in(fleet.main_home, "lead") if (fleet.main_home / "state").is_dir() else []
+    return leads + [record for home in fleet.homes() for record in fleet.records_in(home, "worker")]
+
+
+def account_number(value: str) -> int:
+    """Exactly 1, 2 or 3; no alias and no other profile folder is an account."""
+    if value not in ("1", "2", "3"):
+        raise argparse.ArgumentTypeError(f"not an account: {value!r} (use 1, 2 or 3)")
+    return int(value)
+
+
+def identifier(value: str) -> str:
+    if not IDENTIFIER.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"not a task or lead id: {value!r}")
+    return value
+
+
+def parser(home: Path) -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--to", required=True, type=account_number, metavar="N",
+                        help="the account to move to: 1 (the default login), 2 or 3")
+    common.add_argument("--go", action="store_true",
+                        help="act on the plan; without it nothing is stopped, copied or written")
+    options = argparse.ArgumentParser(
+        prog=NAME,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+        description=(
+            "Move running Claude agents to another Claude account, each with its exact\n"
+            "conversation, resumed in the same Herdr pane. Every run prints the plan first:\n"
+            "each agent, its Firstmate home, the account it runs on now, its conversation id\n"
+            "and the account it moves to. Without --go nothing is stopped, copied or written.\n"
+            f"A busy agent is moved at its next pause; one still busy after {PAUSE_SECONDS} s is\n"
+            "left running as it was."),
+        epilog=(
+            "Use it only on the captain's word or on the First Mate's routed request\n"
+            "(skill: account-swap). It never changes which account new workers start\n"
+            "on: each home's config/claude-account pin stays the captain's choice. It never\n"
+            "touches credentials, the Keychain, login items or any account's settings.\n\n"
+            f"account 1: the default login, {home / '.claude'}, CLAUDE_CONFIG_DIR unset\n"
+            f"account 2: CLAUDE_CONFIG_DIR={home / ACCOUNT_FOLDERS[1][1]}\n"
+            f"account 3: CLAUDE_CONFIG_DIR={home / ACCOUNT_FOLDERS[2][1]} "
+            "(only when the folder exists)\n\n"
+            "--go keeps each run's resume commands and log under\n"
+            f"{state_root(home)}/<time>-<pid>.\n\n"
+            "exit 0  every agent in the plan is ready (with --go: moved, or already there)\n"
+            "exit 1  at least one agent was refused, left busy, or not moved, or the\n"
+            "        process list could not be read\n"
+            "exit 2  usage error\n"
+            "exit 3  nothing matched: no such worker or lead, nothing recorded runs on\n"
+            "        that account, or Herdr is not available"))
+    scopes = options.add_subparsers(dest="scope", required=True, metavar="{worker,lead,all}")
+    worker = scopes.add_parser("worker", parents=[common], allow_abbrev=False,
+                               help="one worker, by its task id")
+    worker.add_argument("task", type=identifier, help="the worker's task id")
+    worker.add_argument("--home", metavar="HOME",
+                        help="main, a lead's domain, or a Firstmate home folder; needed only when "
+                             "two homes record the same task id")
+    lead = scopes.add_parser("lead", parents=[common], allow_abbrev=False,
+                             help="one lead (a second mate's own conversation)")
+    lead.add_argument("lead", type=identifier, help="the lead's id (its domain)")
+    lead.add_argument("--with-crew", action="store_true",
+                      help="also move every worker recorded in the lead's home")
+    every = scopes.add_parser("all", parents=[common], allow_abbrev=False,
+                              help="every recorded worker and lead running on one account")
+    every.add_argument("--from", dest="source", required=True, type=account_number, metavar="N",
+                       help="the account to empty: 1, 2 or 3")
+    return options
+
+
+def state_root(home: Path) -> Path:
+    configured = os.environ.get("XDG_STATE_HOME", "")
+    base = Path(configured) if os.path.isabs(configured) else home / ".local/state"
+    return base / NAME
+
+
+def plan(fleet: Fleet, options: argparse.Namespace, target: Account, reporter: Reporter
+         ) -> tuple[list[Agent], list[str]] | None:
+    records = select_records(fleet, options, reporter)
+    if records is None:
+        return None
+    agents = [fleet.inspect(record) for record in records]
+    footer: list[str] = []
+    if options.scope == "all":
+        source = fleet.accounts[options.source]
+        checked = [agent for agent in agents if agent.running and agent.account is None]
+        skipped = sum(1 for agent in agents if not agent.running)
+        agents = [agent for agent in agents if agent.running and agent.account == source]
+        inspected = {agent.pid for agent in agents + checked if agent.pid}
+        for session in fleet.sessions.values():
+            if session.account == source and session.live and session.pid not in inspected:
+                mark = " (the session running this tool)" if session.pid in fleet.mine else ""
+                footer.append(f"also on {source.label}, not moved (no Firstmate worker or lead record): "
+                              f"pid {session.pid} in {session.cwd or 'an unknown folder'}{mark}")
+        footer += [f"not checked: {agent.label} ({fleet.home_label(agent.record.home)}): {agent.problem}"
+                   for agent in checked]
+        if skipped:
+            footer.append(f"skipped {skipped} Firstmate records with no Claude agent of theirs running here "
+                          "(finished tasks, other harnesses, other machines)")
+    elif options.scope == "lead" and options.with_crew:
+        skipped = sum(1 for agent in agents[1:] if not agent.running)
+        agents = agents[:1] + [agent for agent in agents[1:] if agent.running]
+        if skipped:
+            footer.append(f"skipped {skipped} crew records with no Claude agent of theirs running here "
+                          "(finished tasks, other harnesses, other machines)")
+    return agents, footer
+
+
+def act(fleet: Fleet, agents: list[Agent], target: Account, reporter: Reporter) -> list[Outcome]:
+    root = state_root(fleet.home)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = (root / ".run.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"{NAME}: another {NAME} run is acting; wait for it to finish") from None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_folder = root / f"{stamp}-{os.getpid()}"
+    run_folder.mkdir(mode=0o700)
+    reporter.log = run_folder / "log"
+    interrupt = Interrupt()
+    interrupt.install(reporter)
+    mover = Mover(fleet, target, reporter, run_folder, stamp)
+    reporter.line(f"acting; resume commands and this log are kept in {run_folder}")
+    outcomes: list[Outcome] = []
+    pending = []
+    for agent in agents:
+        kind, text = plan_cell(agent, target)
+        if kind == "refused":
+            outcomes.append(Outcome(agent, "refused", "not moved: " + text.removeprefix("refused: ")))
+        elif kind == "already":
+            outcomes.append(Outcome(agent, "already", f"already on {target.label}; nothing to do"))
+        else:
+            pending.append(agent)
+    deadline = time.monotonic() + PAUSE_SECONDS
+    announced: set[int] = set()
+    while pending and not interrupt.requested:
+        waiting = []
+        for planned in pending:
+            if interrupt.requested:
+                waiting.append(planned)
+                continue
+            try:
+                fleet.refresh()
+            except Refusal as refusal:
+                outcomes.append(Outcome(planned, "refused", f"not moved: {refusal}; it is still running as it was"))
+                continue
+            try:
+                current = reread_endpoint(planned.record)
+            except Refusal as refusal:
+                outcomes.append(Outcome(planned, "refused", f"not moved: {refusal}; it is still running as it was"))
+                continue
+            agent = fleet.inspect(current)
+            reason = None if agent.problem else busy_reason(agent)
+            if reason is not None:
+                if time.monotonic() < deadline:
+                    waiting.append(planned)
+                    if id(planned) not in announced:
+                        announced.add(id(planned))
+                        mover.say(agent, f"waiting: {reason}")
+                    continue
+                outcome = Outcome(agent, "refused", f"not moved: still busy after {PAUSE_SECONDS} s "
+                                  f"({reason}); it is still running as it was")
+            else:
+                outcome = mover.move(planned, agent)
+            if outcome.result == "waiting":
+                if time.monotonic() < deadline:
+                    waiting.append(planned)
+                    if id(planned) not in announced:
+                        announced.add(id(planned))
+                        mover.say(agent, f"waiting: {outcome.text}")
+                    continue
+                outcome = Outcome(agent, "refused", f"not moved: still busy after {PAUSE_SECONDS} s "
+                                  f"({outcome.text}); it is still running as it was")
+            if outcome.result != "moved":
+                mover.say(agent, outcome.text)
+            outcomes.append(outcome)
+        pending = waiting
+        pause = min(time.monotonic() + BUSY_RECHECK_SECONDS, deadline)
+        while pending and not interrupt.requested and time.monotonic() < pause:
+            time.sleep(0.25)
+    for planned in pending:
+        outcomes.append(Outcome(planned, "refused", "not moved: the run was stopped before it was reached"))
+    return outcomes
+
+
+def main(arguments: list[str]) -> int:
+    home = Path.home()
+    options = parser(home).parse_args(arguments)
+    reporter = Reporter()
+    try:
+        fleet = Fleet(home)
+    except Refusal as refusal:
+        reporter.line(f"{NAME}: {refusal}", error=True)
+        return EXIT_NOT_ALL_MOVED
+    if not fleet.herdr:
+        reporter.line(f"{NAME}: herdr is not on PATH, so no agent's pane can be read", error=True)
+        return EXIT_NOTHING
+    target = fleet.accounts[options.to]
+    folders = [target] + ([fleet.accounts[options.source]] if options.scope == "all" else [])
+    for account in folders:
+        if not account.root.is_dir():
+            reporter.line(f"{NAME}: {account.label} has no folder on this machine ({account.root})", error=True)
+            return 2
+    if options.scope == "all" and options.source == options.to:
+        reporter.line(f"{NAME}: --from and --to name the same account", error=True)
+        return 2
+    try:
+        planned = plan(fleet, options, target, reporter)
+    except SystemExit as stop:
+        if isinstance(stop.code, str):
+            reporter.line(stop.code, error=True)
+            return 2
+        raise
+    if planned is None:
+        return EXIT_NOTHING
+    agents, footer = planned
+    scope = {"worker": "one worker", "lead": "one lead" + (" and its crew" if getattr(options, "with_crew", False) else ""),
+             "all": f"every recorded agent on account {getattr(options, 'source', '')}"}[options.scope]
+    reporter.line(f"{NAME} plan: {scope}, to {target.label} ({target.environment_text})")
+    reporter.line()
+    if agents:
+        for line in render_plan(fleet, agents, target):
+            reporter.line(line)
+    else:
+        reporter.line(f"  nothing recorded runs on account {options.source}")
+    for line in footer:
+        reporter.line(line)
+    reporter.line()
+    cells = [plan_cell(agent, target)[0] for agent in agents]
+    if not agents:
+        return EXIT_NOTHING
+    if not options.go:
+        ready = sum(1 for cell in cells if cell in ("move", "busy"))
+        reporter.line("dry run: nothing was stopped, copied or written."
+                      + (f" Run again with --go to move the {ready} agent{'s' if ready != 1 else ''} "
+                         "marked move or wait." if ready else ""))
+        return EXIT_NOT_ALL_MOVED if "refused" in cells else 0
+    if not any(cell in ("move", "busy") for cell in cells):
+        reporter.line("nothing to move.")
+        return EXIT_NOT_ALL_MOVED if "refused" in cells else 0
+    try:
+        outcomes = act(fleet, agents, target, reporter)
+    except SystemExit as stop:
+        if isinstance(stop.code, str):
+            reporter.line(stop.code, error=True)
+            return EXIT_NOT_ALL_MOVED
+        raise
+    counts = {result: sum(1 for outcome in outcomes if outcome.result == result)
+              for result in ("moved", "already", "refused", "restored", "failed")}
+    reporter.line()
+    reporter.line("summary: " + ", ".join(f"{count} {result}" for result, count in counts.items() if count))
+    for outcome in outcomes:
+        if outcome.result not in ("moved", "already"):
+            reporter.line(f"  {outcome.result} {outcome.agent.label} "
+                          f"({fleet.home_label(outcome.agent.record.home)}): {outcome.text}")
+    return 0 if counts["refused"] + counts["restored"] + counts["failed"] == 0 else EXIT_NOT_ALL_MOVED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
